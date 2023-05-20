@@ -7322,6 +7322,16 @@ def get_model_size(model_name):
 def UI_2_save_revision(data):
     koboldai_vars.save_revision()
 
+#==================================================================#
+# Score Image (Image-Reward 1.8 GB Model)
+#==================================================================#
+
+# TODO find better loading of model
+def score_image(prompt, image_path):
+    import ImageReward as reward
+    model = reward.load("ImageReward-v1.0", 'cpu')
+    score = model.score(prompt, image_path)
+    return score
 
 #==================================================================#
 # Generate Image
@@ -7468,6 +7478,11 @@ def generate_story_image(
         log_image_generation(prompt, display_prompt, file_name, generation_type, log_data)
         #let's also add this data to the action so we know where the latest picture is at
         logger.info("setting picture filename")
+
+        # Slow to load, but executes fast on cpu
+        #score = score_image(prompt, (os.path.join(koboldai_vars.save_paths.generated_images, file_name)))
+        #logger.debug("Story Image Scored: " + str(score))
+
         try:
             koboldai_vars.actions.set_picture(int(log_data['actionId']), file_name, prompt)
         except KeyError:
@@ -7659,7 +7674,7 @@ def text2img_api(prompt, art_guide="") -> Image.Image:
         "steps": koboldai_vars.img_gen_steps,
         "cfg_scale": koboldai_vars.img_gen_cfg_scale,
         "negative_prompt": koboldai_vars.img_gen_negative_prompt,
-        "sampler_index": "Euler a"
+        "sampler_index": koboldai_vars.img_gen_sampler
     }
     apiaddress = '{}/sdapi/v1/txt2img'.format(koboldai_vars.img_gen_api_url.rstrip("/"))
     payload_json = json.dumps(final_imgen_params)
@@ -7770,15 +7785,15 @@ def summarize(text, max_length=100, min_length=30, unload=True):
     start_time = time.time()
 
     # load summarizer model
-    if koboldai_vars.summarizer is None:
-        if os.path.exists("functional_models/{}".format(args.summarizer_model.replace('/', '_'))):
-            koboldai_vars.summary_tokenizer = AutoTokenizer.from_pretrained("functional_models/{}".format(args.summarizer_model.replace('/', '_')), cache_dir="cache")
-            koboldai_vars.summarizer = AutoModelForSeq2SeqLM.from_pretrained("functional_models/{}".format(args.summarizer_model.replace('/', '_')), cache_dir="cache")
-        else:
-            koboldai_vars.summary_tokenizer = AutoTokenizer.from_pretrained(args.summarizer_model, cache_dir="cache")
-            koboldai_vars.summarizer = AutoModelForSeq2SeqLM.from_pretrained(args.summarizer_model, cache_dir="cache")
-            koboldai_vars.summary_tokenizer.save_pretrained("functional_models/{}".format(args.summarizer_model.replace('/', '_')), max_shard_size="500MiB")
-            koboldai_vars.summarizer.save_pretrained("functional_models/{}".format(args.summarizer_model.replace('/', '_')), max_shard_size="500MiB")
+    #if koboldai_vars.summarizer is None:
+    #    if os.path.exists("functional_models/{}".format(args.summarizer_model.replace('/', '_'))):
+    #        koboldai_vars.summary_tokenizer = AutoTokenizer.from_pretrained("functional_models/{}".format(args.summarizer_model.replace('/', '_')), cache_dir="cache")
+    #        koboldai_vars.summarizer = AutoModelForSeq2SeqLM.from_pretrained("functional_models/{}".format(args.summarizer_model.replace('/', '_')), cache_dir="cache")
+    #    else:
+    #        koboldai_vars.summary_tokenizer = AutoTokenizer.from_pretrained(args.summarizer_model, cache_dir="cache")
+    #        koboldai_vars.summarizer = AutoModelForSeq2SeqLM.from_pretrained(args.summarizer_model, cache_dir="cache")
+    #        koboldai_vars.summary_tokenizer.save_pretrained("functional_models/{}".format(args.summarizer_model.replace('/', '_')), max_shard_size="500MiB")
+    #        koboldai_vars.summarizer.save_pretrained("functional_models/{}".format(args.summarizer_model.replace('/', '_')), max_shard_size="500MiB")
 
     # load prompt generator model
     if koboldai_vars.prompt_gen is None:
@@ -7804,17 +7819,24 @@ def summarize(text, max_length=100, min_length=30, unload=True):
 
     #Try GPU accel
     if koboldai_vars.hascuda and torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_reserved(0) >= 1645778560:
-        koboldai_vars.summarizer.to(0)
+        #koboldai_vars.summarizer.to(0)
         koboldai_vars.interogator.to(0)
         koboldai_vars.prompt_gen.to(0)
         device=0
     else:
         device=-1
 
-    summarizer = tpool.execute(pipeline, task="summarization", model=koboldai_vars.summarizer, tokenizer=koboldai_vars.summary_tokenizer, device=device)
+    #summarizer  = tpool.execute(pipeline, task="summarization", model=koboldai_vars.summarizer, tokenizer=koboldai_vars.summary_tokenizer, device=device)
     interogator = tpool.execute(pipeline, task="question-answering", model=koboldai_vars.interogator, tokenizer=koboldai_vars.interogator_tokenizer, device=device)
-    prompt_gen = tpool.execute(pipeline, task="text-generation", model=koboldai_vars.prompt_gen, tokenizer=koboldai_vars.prompt_gen_tokenizer, device=device)
+    prompt_gen  = tpool.execute(pipeline, task="text-generation", model=koboldai_vars.prompt_gen, tokenizer=koboldai_vars.prompt_gen_tokenizer, device=device)
     logger.debug("Time to load Summarizer, Interogator and Prompt-Generator: {}".format(time.time()-start_time))
+
+    def SearchWorldInfo(Name):
+        descriptors_from_wi = ''
+        for entry in koboldai_vars.worldinfo:
+            if re.fullmatch(Name, entry['key']):
+                descriptors_from_wi += tpool.execute(interogator, 'What are the describtors?', entry['content'])['answer']
+        return descriptors_from_wi
 
     #Actual sumarization
     start_time = time.time()
@@ -7822,83 +7844,94 @@ def summarize(text, max_length=100, min_length=30, unload=True):
     if len(koboldai_vars.summary_tokenizer.encode(text)) > 1000:
         text = koboldai_vars.summary_tokenizer.decode(koboldai_vars.summary_tokenizer.encode(text)[:1000])
 
-    output = tpool.execute(summarizer, text, max_length=max_length, min_length=min_length, do_sample=False)[0]['summary_text']
-    logger.debug('Summary: ' + output)
-    logger.debug("Time for summarize: {}".format(time.time()-start_time))
+    # workaround, sometimes max_length is less then min_length for summarizer
+    #if max_length < min_length:
+    #    max_length = min_length
+
+    #summarizer_output = tpool.execute(summarizer, text, max_length=max_length, min_length=min_length, do_sample=False)[0]['summary_text']
+    #logger.debug('Summary: ' + summarizer_output)
+    #logger.debug("Time for summarize: {}".format(time.time()-start_time))
 
     start_time = time.time()
-    # key extraction for character
-    question_person1    = 'What person is this text about?'
-    answer_person1_1  = tpool.execute(interogator, question_person1, output)['answer']
-    #answer_person1_2 = tpool.execute(interogator, question_person1, text)['answer']
-    logger.debug(question_person1 + ": " + answer_person1_1)
 
-    question_person2    = "What are all the descriptors for " + answer_person1_1
-    answer_person2_1  = tpool.execute(interogator, question_person2, output)['answer']
-    #answer_person2_2 = tpool.execute(interogator, question_person2, text)['answer']
-    logger.debug(question_person2 + ": " + answer_person2_1)
+    # extraction for character
+    story_character = []
+    question_person1  = 'What person is this text about?'
+    story_character.append(tpool.execute(interogator, question_person1, text)['answer'])
+    logger.debug(question_person1 + ": " + story_character[0])
 
-    #question_person3    = "What are all the descriptors for " + answer_person1_1
-    #answer_person3_1 = tpool.execute(interogator, question_person2, output)['answer']
-    #answer_person3_2  = tpool.execute(interogator, question_person2, text)['answer']
+    question_person2  = "What are all the descriptors for " + story_character[0]
+    story_character.append(tpool.execute(interogator, question_person2, text)['answer'])
+    logger.debug(question_person2 + ": " + story_character[1])
 
-    person_string = answer_person1_1 + ', ' + answer_person2_1 + ', detailed face'
+    character_from_wi = SearchWorldInfo(story_character[0])
+    if character_from_wi != '':
+        story_character.extend([character_from_wi,'detailed face'])
+    else:
+        story_character.append('detailed face')
 
-    # first key extraction location information
+    story_character_str = (",".join(sorted(set(story_character), key=story_character.index)))
+
+    # extraction location information
+    story_location = []
     question_location1 = 'What place does the text describe?'
-    answer_location1_1 = tpool.execute(interogator, question_location1, output)['answer']
-    answer_location1_2 = tpool.execute(interogator, question_location1, text)['answer']
+    story_location.append(tpool.execute(interogator, question_location1, text)['answer'])
+    question_location2 = "How is " + story_location[0] + " described in detail?"
+    question_location3 = "What are all the descriptors for " + story_location[0] + "?"
+    story_location.append(tpool.execute(interogator, question_location2, text)['answer'])
+    story_location.append(tpool.execute(interogator, question_location3, text)['answer'])
 
-    # secondary extraction for location information
-    question_location2 = "How is " + answer_location1_1 + " described in detail?"
-    question_location3 = "What are all the descriptors for " + answer_location1_1 + "?"
-    answer_location2_1 = tpool.execute(interogator, question_location2, output)['answer']
-    answer_location2_2 = tpool.execute(interogator, question_location2, text)['answer']
-    answer_location3_1 = tpool.execute(interogator, question_location3, output)['answer']
-    answer_location3_2 = tpool.execute(interogator, question_location3, text)['answer']
+    location_from_wi = SearchWorldInfo(story_location[0])
+    if location_from_wi != '':
+        story_location.append(location_from_wi)
 
-    logger.debug(question_location1 + ": " + answer_location1_1)
-    logger.debug(question_location2 + ": " + answer_location2_2)
-    logger.debug(question_location3 + ": " + answer_location3_2)
-
-    logger.debug(question_location1 + " (FullText): " + answer_location1_2)
-    logger.debug(question_location2 + " (FullText): " + answer_location2_2)
-    logger.debug(question_location3 + " (FullText): " + answer_location3_2)
+    logger.debug(question_location1 + " " + story_location[0])
+    logger.debug(question_location2 + " " + story_location[1])
+    logger.debug(question_location3 + " " + story_location[2])
 
     # create location prompt and dedupe any repeated keywords
-    location_strings = answer_location1_1 + ', ' + answer_location1_2 + ', ' + answer_location2_1 + ', ' + answer_location2_2 + ', ' + answer_location3_1 + ', ' + answer_location3_2
-    location_strings = location_strings.split(',')
-    location_strings = (",".join(sorted(set(location_strings), key=location_strings.index)))
-
+    story_location_str = (",".join(sorted(set(story_location), key=story_location.index)))
+    combined_str = story_location_str + ', (' + story_character_str + '),'
     logger.debug("Time for Interogate: {}".format(time.time()-start_time))
 
-    combined_str = location_strings + ', (' + person_string +'),'
     start_time = time.time()
     generated_prompt = tpool.execute(prompt_gen, combined_str, max_new_tokens=50)[0]['generated_text']
     logger.debug('Generated Prompt: ' + generated_prompt)
     logger.debug("Time for Prompt: {}".format(time.time()-start_time))
 
+    # use clip-vit for estimation, tends to undershoot real webui tokenizers
+    # which is fine. Longer prompts don't always make for better images anyway
     clip_model_tokenizer = 'openai/clip-vit-base-patch16'
     if os.path.exists("functional_models/{}".format(clip_model_tokenizer.replace('/', '_'))):
         clip_tokenizer = AutoTokenizer.from_pretrained("functional_models/{}".format(clip_model_tokenizer.replace('/', '_')), cache_dir="cache")
     else:
         clip_tokenizer = AutoTokenizer.from_pretrained(clip_model_tokenizer, cache_dir="cache")
         clip_tokenizer .save_pretrained("functional_models/{}".format(clip_model_tokenizer.replace('/', '_')), max_shard_size="500MiB")
-    tokenized_prompt = clip_tokenizer.encode(generated_prompt)
-    while tokenized_prompt.__len__() > 100:
+    tokenized_prompt = clip_tokenizer.encode(generated_prompt + ', ' + koboldai_vars.img_gen_art_guide)
+
+    # allow more tokens for webui api image generation
+    if koboldai_vars.img_gen_priority == 4:
+        max_sd_tokens = 150
+    else:
+        max_sd_tokens = 75
+
+    while tokenized_prompt.__len__() > max_sd_tokens:
         generated_prompt = generated_prompt.rsplit(' ', 1)[0]
-        tokenized_prompt = clip_tokenizer.encode(generated_prompt)
+        tokenized_prompt = clip_tokenizer.encode(generated_prompt + ', ' + koboldai_vars.img_gen_art_guide)
+
+    logger.debug("Total tokens to SD: {}".format(tokenized_prompt.__len__()))
+
     #move model back to CPU to save precious vram
     torch.cuda.empty_cache()
     logger.debug("VRAM used by summarization: {}".format(torch.cuda.memory_reserved(0)))
     if unload:
-        koboldai_vars.summarizer.to("cpu")
+        #koboldai_vars.summarizer.to("cpu")
         koboldai_vars.interogator.to("cpu")
         koboldai_vars.prompt_gen.to("cpu")
     torch.cuda.empty_cache()
 
     #logger.debug("Original Text: {}".format(text))
-    #logger.debug("Summarized Text: {}".format(output))
+    #logger.debug("Summarized Text: {}".format(summarizer_output))
 
     return generated_prompt
 
