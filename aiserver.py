@@ -7369,19 +7369,31 @@ def UI_2_generate_image_from_story(data):
     #text to summarize (get 1000 tokens worth of text):
     text = []
     text_length = 0
+    text2 = []
+    text2_length = 0
     for item in reversed(koboldai_vars.actions.to_sentences(max_action_id=action_id)):
-        if len(koboldai_vars.interogator_tokenizer.encode(item[0])) + text_length <= 1000:
+        if len(koboldai_vars.interogator_tokenizer.encode(item[0])) + text_length <= 650:
             text.append(item[0])
             text_length += len(koboldai_vars.interogator_tokenizer.encode(item[0]))
+        elif (len(koboldai_vars.interogator_tokenizer.encode(item[0])) + text_length > 650) and (text2_length < 1300):
+            text2.append(item[0])
+            text2_length += len(koboldai_vars.interogator_tokenizer.encode(item[0]))
         else:
             break
-    text = "".join(text)
-    logger.debug("Text to interogate: {}".format(text))
+    text  = "".join(text)
+    text2 = "".join(text2)
+    logger.debug("Text1 to interogate: {}".format(text))
+    logger.debug("Text2 to interogate: {}".format(text2))
 
-    prompt = interogate_text(text)
-    prompt = prompt_generator(prompt)
+    prompt  = interogate_text(text)
+    prompt2 = interogate_text(text2)
 
-    logger.debug("Text from interogate: {}".format(prompt))
+    # combine and deduplicate entries
+    combined_batches = prompt + prompt2
+    prompt_str = (",".join(sorted(set(combined_batches), key=combined_batches.index)))
+    prompt = prompt_generator(prompt_str)
+
+    logger.debug("Text from interogate and prompt gen: {}".format(prompt))
 
     if art_guide:
         if '<|>' in art_guide:
@@ -7904,9 +7916,9 @@ def interogate_text(text, unload=True):
     #make sure text is less than 1024 tokens, otherwise we'll crash
     if len(text) == 0:
         return "No Description"
-    if len(koboldai_vars.interogator_tokenizer.encode(text)) > 1000:
-        text = koboldai_vars.interogator_tokenizer.decode(
-            koboldai_vars.interogator_tokenizer.encode(text)[:1000])
+    #if len(koboldai_vars.interogator_tokenizer.encode(text)) > 1000:
+    #    text = koboldai_vars.interogator_tokenizer.decode(
+    #        koboldai_vars.interogator_tokenizer.encode(text)[:1000])
 
     #Try GPU accel
     if koboldai_vars.hascuda and torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_reserved(0) >= 1645778560:
@@ -7917,6 +7929,7 @@ def interogate_text(text, unload=True):
 
     interogator = tpool.execute(pipeline, task="question-answering", model=koboldai_vars.interogator, tokenizer=koboldai_vars.interogator_tokenizer, device=device)
     logger.debug("Time to load Interogator: {}".format(time.time()-start_time))
+    start_time = time.time()
 
     def SearchWorldInfo(Name):
         descriptors_from_wi = ''
@@ -7941,8 +7954,6 @@ def interogate_text(text, unload=True):
     else:
         story_character.append('detailed face')
 
-    story_character_str = (",".join(sorted(set(story_character), key=story_character.index)))
-
     # extraction location information
     story_location = []
     question_location1 = 'What place does the text describe?'
@@ -7960,13 +7971,16 @@ def interogate_text(text, unload=True):
     logger.debug(question_location2 + " " + story_location[1])
     logger.debug(question_location3 + " " + story_location[2])
 
-    # create location prompt and dedupe any repeated keywords
-    story_location_str = (",".join(sorted(set(story_location), key=story_location.index)))
-    combined_str = story_location_str + ', (' + story_character_str + '),'
-    start_time = time.time()
-    logger.debug("Time for Interogate: {}".format(time.time()-start_time))
+    list = story_character + story_location
 
-    return combined_str
+    # remove punctuation
+    full_list = []
+    for item in list:
+        full_list.append(re.sub(r'[^\w\s]', '', item))
+
+    logger.debug("Time for interogate: {}".format(time.time()-start_time))
+
+    return full_list
 
 #==================================================================#
 # Auto-memory function
