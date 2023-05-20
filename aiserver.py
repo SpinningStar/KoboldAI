@@ -7359,26 +7359,29 @@ def UI_2_generate_image_from_story(data):
     logger.info("Generating image for action {}".format(action_id))
 
     start_time = time.time()
-    if os.path.exists("functional_models/{}".format(args.summarizer_model.replace('/', '_'))):
-        koboldai_vars.summary_tokenizer = AutoTokenizer.from_pretrained("functional_models/{}".format(args.summarizer_model.replace('/', '_')), cache_dir="cache")
-    else:
-        koboldai_vars.summary_tokenizer = AutoTokenizer.from_pretrained(args.summarizer_model, cache_dir="cache")
+
+    if koboldai_vars.interogator_tokenizer is None:
+        if os.path.exists("functional_models/{}".format(args.interogator_model.replace('/', '_'))):
+            koboldai_vars.interogator_tokenizer = AutoTokenizer.from_pretrained(args.interogator_model, cache_dir="cache")
+        else:
+            koboldai_vars.interogator_tokenizer = AutoTokenizer.from_pretrained(args.interogator_model, cache_dir="cache")
+
     #text to summarize (get 1000 tokens worth of text):
     text = []
     text_length = 0
     for item in reversed(koboldai_vars.actions.to_sentences(max_action_id=action_id)):
-        if len(koboldai_vars.summary_tokenizer.encode(item[0])) + text_length <= 1000:
+        if len(koboldai_vars.interogator_tokenizer.encode(item[0])) + text_length <= 1000:
             text.append(item[0])
-            text_length += len(koboldai_vars.summary_tokenizer.encode(item[0]))
+            text_length += len(koboldai_vars.interogator_tokenizer.encode(item[0]))
         else:
             break
     text = "".join(text)
-    logger.debug("Text to summarizer: {}".format(text))
+    logger.debug("Text to interogate: {}".format(text))
 
-    max_length = args.max_summary_length - len(koboldai_vars.summary_tokenizer.encode(art_guide))
-    keys = [summarize(text, max_length=max_length)]
-    prompt = ", ".join(keys)
-    logger.debug("Text from summarizer: {}".format(prompt))
+    prompt = interogate_text(text)
+    prompt = prompt_generator(prompt)
+
+    logger.debug("Text from interogate: {}".format(prompt))
 
     if art_guide:
         if '<|>' in art_guide:
@@ -7777,25 +7780,55 @@ def get_items_locations_from_text(text):
 # summarizer
 #==================================================================#
 def summarize(text, max_length=100, min_length=30, unload=True):
-
-    if len(text) == 0:
-        return "No Description"
-
-    from transformers import pipeline, AutoModelForQuestionAnswering
+    from transformers import pipeline as summary_pipeline
     start_time = time.time()
+    if koboldai_vars.summarizer is None:
+        if os.path.exists("functional_models/{}".format(args.summarizer_model.replace('/', '_'))):
+            koboldai_vars.summary_tokenizer = AutoTokenizer.from_pretrained("functional_models/{}".format(args.summarizer_model.replace('/', '_')), cache_dir="cache")
+            koboldai_vars.summarizer = AutoModelForSeq2SeqLM.from_pretrained("functional_models/{}".format(args.summarizer_model.replace('/', '_')), cache_dir="cache")
+        else:
+            koboldai_vars.summary_tokenizer = AutoTokenizer.from_pretrained(args.summarizer_model, cache_dir="cache")
+            koboldai_vars.summarizer = AutoModelForSeq2SeqLM.from_pretrained(args.summarizer_model, cache_dir="cache")
+            koboldai_vars.summary_tokenizer.save_pretrained("functional_models/{}".format(args.summarizer_model.replace('/', '_')), max_shard_size="500MiB")
+            koboldai_vars.summarizer.save_pretrained("functional_models/{}".format(args.summarizer_model.replace('/', '_')), max_shard_size="500MiB")
 
-    # load summarizer model
-    #if koboldai_vars.summarizer is None:
-    #    if os.path.exists("functional_models/{}".format(args.summarizer_model.replace('/', '_'))):
-    #        koboldai_vars.summary_tokenizer = AutoTokenizer.from_pretrained("functional_models/{}".format(args.summarizer_model.replace('/', '_')), cache_dir="cache")
-    #        koboldai_vars.summarizer = AutoModelForSeq2SeqLM.from_pretrained("functional_models/{}".format(args.summarizer_model.replace('/', '_')), cache_dir="cache")
-    #    else:
-    #        koboldai_vars.summary_tokenizer = AutoTokenizer.from_pretrained(args.summarizer_model, cache_dir="cache")
-    #        koboldai_vars.summarizer = AutoModelForSeq2SeqLM.from_pretrained(args.summarizer_model, cache_dir="cache")
-    #        koboldai_vars.summary_tokenizer.save_pretrained("functional_models/{}".format(args.summarizer_model.replace('/', '_')), max_shard_size="500MiB")
-    #        koboldai_vars.summarizer.save_pretrained("functional_models/{}".format(args.summarizer_model.replace('/', '_')), max_shard_size="500MiB")
+    #Try GPU accel
+    if koboldai_vars.hascuda and torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_reserved(0) >= 1645778560:
+        koboldai_vars.summarizer.to(0)
+        device=0
+    else:
+        device=-1
+    summarizer = tpool.execute(summary_pipeline, task="summarization", model=koboldai_vars.summarizer, tokenizer=koboldai_vars.summary_tokenizer, device=device)
+    logger.debug("Time to load summarizer: {}".format(time.time()-start_time))
+
+    #Actual sumarization
+    start_time = time.time()
+    #make sure text is less than 1024 tokens, otherwise we'll crash
+    if len(koboldai_vars.summary_tokenizer.encode(text)) > 1000:
+        text = koboldai_vars.summary_tokenizer.decode(koboldai_vars.summary_tokenizer.encode(text)[:1000])
+    output = tpool.execute(summarizer, text, max_length=max_length, min_length=min_length, do_sample=False)[0]['summary_text']
+    logger.debug("Time to summarize: {}".format(time.time()-start_time))
+    #move model back to CPU to save precious vram
+    torch.cuda.empty_cache()
+    logger.debug("VRAM used by summarization: {}".format(torch.cuda.memory_reserved(0)))
+    if unload:
+        koboldai_vars.summarizer.to("cpu")
+    torch.cuda.empty_cache()
+
+    #logger.debug("Original Text: {}".format(text))
+    #logger.debug("Summarized Text: {}".format(output))
+
+    return output
+
+#==================================================================#
+# enhance prompt generation
+#==================================================================#
+def prompt_generator(text, unload=True):
+
+    from transformers import pipeline
 
     # load prompt generator model
+    start_time = time.time()
     if koboldai_vars.prompt_gen is None:
         from transformers import GPT2LMHeadModel, GPT2Tokenizer
         if os.path.exists("functional_models/{}".format(args.prompt_gen.replace('/', '_'))):
@@ -7807,6 +7840,57 @@ def summarize(text, max_length=100, min_length=30, unload=True):
             koboldai_vars.prompt_gen = GPT2LMHeadModel.from_pretrained(args.prompt_gen, cache_dir="cache")
             koboldai_vars.prompt_gen.save_pretrained("functional_models/{}".format(args.prompt_gen.replace('/', '_')), max_shard_size="500MiB")
 
+    #Try GPU accel
+    if koboldai_vars.hascuda and torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_reserved(0) >= 1645778560:
+        koboldai_vars.prompt_gen.to(0)
+        device=0
+    else:
+        device=-1
+
+    prompt_gen       = tpool.execute(pipeline, task="text-generation", model=koboldai_vars.prompt_gen, tokenizer=koboldai_vars.prompt_gen_tokenizer, device=device)
+    generated_prompt = tpool.execute(prompt_gen, text, max_new_tokens=50)[0]['generated_text']
+    logger.debug('Generated Prompt: ' + generated_prompt)
+    logger.debug("Time for Prompt: {}".format(time.time()-start_time))
+
+    # use clip-vit for estimation, tends to undershoot real webui tokenizers
+    # which is fine. Longer prompts don't always make for better images anyway
+    clip_model_tokenizer = 'openai/clip-vit-base-patch16'
+    if os.path.exists("functional_models/{}".format(clip_model_tokenizer.replace('/', '_'))):
+        clip_tokenizer = AutoTokenizer.from_pretrained("functional_models/{}".format(clip_model_tokenizer.replace('/', '_')), cache_dir="cache")
+    else:
+        clip_tokenizer = AutoTokenizer.from_pretrained(clip_model_tokenizer, cache_dir="cache")
+        clip_tokenizer .save_pretrained("functional_models/{}".format(clip_model_tokenizer.replace('/', '_')), max_shard_size="500MiB")
+    tokenized_prompt = clip_tokenizer.encode(generated_prompt + ', ' + koboldai_vars.img_gen_art_guide)
+
+    # allow more tokens for webui api image generation
+    if koboldai_vars.img_gen_priority == 4:
+        max_sd_tokens = 150
+    else:
+        max_sd_tokens = 75
+
+    while tokenized_prompt.__len__() > max_sd_tokens:
+        generated_prompt = generated_prompt.rsplit(' ', 1)[0]
+        tokenized_prompt = clip_tokenizer.encode(generated_prompt + ', ' + koboldai_vars.img_gen_art_guide)
+
+    logger.debug("Total tokens to SD: {}".format(tokenized_prompt.__len__()))
+
+    #move model back to CPU to save precious vram
+    torch.cuda.empty_cache()
+    logger.debug("VRAM used by Prompt Generator: {}".format(torch.cuda.memory_reserved(0)))
+    if unload:
+        koboldai_vars.prompt_gen.to("cpu")
+    torch.cuda.empty_cache()
+
+    return generated_prompt
+
+#==================================================================#
+# interogate text for prompting
+#==================================================================#
+def interogate_text(text, unload=True):
+
+    from transformers import pipeline, AutoModelForQuestionAnswering
+    start_time = time.time()
+
     # load interogator model
     if koboldai_vars.interogator is None:
         if os.path.exists("functional_models/{}".format(args.interogator_model.replace('/', '_'))):
@@ -7817,19 +7901,22 @@ def summarize(text, max_length=100, min_length=30, unload=True):
             koboldai_vars.interogator = AutoModelForQuestionAnswering.from_pretrained(args.interogator_model, cache_dir="cache")
             koboldai_vars.interogator.save_pretrained("functional_models/{}".format(args.interogator_model.replace('/', '_')), max_shard_size="500MiB")
 
+    #make sure text is less than 1024 tokens, otherwise we'll crash
+    if len(text) == 0:
+        return "No Description"
+    if len(koboldai_vars.interogator_tokenizer.encode(text)) > 1000:
+        text = koboldai_vars.interogator_tokenizer.decode(
+            koboldai_vars.interogator_tokenizer.encode(text)[:1000])
+
     #Try GPU accel
     if koboldai_vars.hascuda and torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_reserved(0) >= 1645778560:
-        #koboldai_vars.summarizer.to(0)
         koboldai_vars.interogator.to(0)
-        koboldai_vars.prompt_gen.to(0)
         device=0
     else:
         device=-1
 
-    #summarizer  = tpool.execute(pipeline, task="summarization", model=koboldai_vars.summarizer, tokenizer=koboldai_vars.summary_tokenizer, device=device)
     interogator = tpool.execute(pipeline, task="question-answering", model=koboldai_vars.interogator, tokenizer=koboldai_vars.interogator_tokenizer, device=device)
-    prompt_gen  = tpool.execute(pipeline, task="text-generation", model=koboldai_vars.prompt_gen, tokenizer=koboldai_vars.prompt_gen_tokenizer, device=device)
-    logger.debug("Time to load Summarizer, Interogator and Prompt-Generator: {}".format(time.time()-start_time))
+    logger.debug("Time to load Interogator: {}".format(time.time()-start_time))
 
     def SearchWorldInfo(Name):
         descriptors_from_wi = ''
@@ -7837,22 +7924,6 @@ def summarize(text, max_length=100, min_length=30, unload=True):
             if re.fullmatch(Name, entry['key']):
                 descriptors_from_wi += tpool.execute(interogator, 'What are the describtors?', entry['content'])['answer']
         return descriptors_from_wi
-
-    #Actual sumarization
-    start_time = time.time()
-    #make sure text is less than 1024 tokens, otherwise we'll crash
-    if len(koboldai_vars.summary_tokenizer.encode(text)) > 1000:
-        text = koboldai_vars.summary_tokenizer.decode(koboldai_vars.summary_tokenizer.encode(text)[:1000])
-
-    # workaround, sometimes max_length is less then min_length for summarizer
-    #if max_length < min_length:
-    #    max_length = min_length
-
-    #summarizer_output = tpool.execute(summarizer, text, max_length=max_length, min_length=min_length, do_sample=False)[0]['summary_text']
-    #logger.debug('Summary: ' + summarizer_output)
-    #logger.debug("Time for summarize: {}".format(time.time()-start_time))
-
-    start_time = time.time()
 
     # extraction for character
     story_character = []
@@ -7892,48 +7963,10 @@ def summarize(text, max_length=100, min_length=30, unload=True):
     # create location prompt and dedupe any repeated keywords
     story_location_str = (",".join(sorted(set(story_location), key=story_location.index)))
     combined_str = story_location_str + ', (' + story_character_str + '),'
+    start_time = time.time()
     logger.debug("Time for Interogate: {}".format(time.time()-start_time))
 
-    start_time = time.time()
-    generated_prompt = tpool.execute(prompt_gen, combined_str, max_new_tokens=50)[0]['generated_text']
-    logger.debug('Generated Prompt: ' + generated_prompt)
-    logger.debug("Time for Prompt: {}".format(time.time()-start_time))
-
-    # use clip-vit for estimation, tends to undershoot real webui tokenizers
-    # which is fine. Longer prompts don't always make for better images anyway
-    clip_model_tokenizer = 'openai/clip-vit-base-patch16'
-    if os.path.exists("functional_models/{}".format(clip_model_tokenizer.replace('/', '_'))):
-        clip_tokenizer = AutoTokenizer.from_pretrained("functional_models/{}".format(clip_model_tokenizer.replace('/', '_')), cache_dir="cache")
-    else:
-        clip_tokenizer = AutoTokenizer.from_pretrained(clip_model_tokenizer, cache_dir="cache")
-        clip_tokenizer .save_pretrained("functional_models/{}".format(clip_model_tokenizer.replace('/', '_')), max_shard_size="500MiB")
-    tokenized_prompt = clip_tokenizer.encode(generated_prompt + ', ' + koboldai_vars.img_gen_art_guide)
-
-    # allow more tokens for webui api image generation
-    if koboldai_vars.img_gen_priority == 4:
-        max_sd_tokens = 150
-    else:
-        max_sd_tokens = 75
-
-    while tokenized_prompt.__len__() > max_sd_tokens:
-        generated_prompt = generated_prompt.rsplit(' ', 1)[0]
-        tokenized_prompt = clip_tokenizer.encode(generated_prompt + ', ' + koboldai_vars.img_gen_art_guide)
-
-    logger.debug("Total tokens to SD: {}".format(tokenized_prompt.__len__()))
-
-    #move model back to CPU to save precious vram
-    torch.cuda.empty_cache()
-    logger.debug("VRAM used by summarization: {}".format(torch.cuda.memory_reserved(0)))
-    if unload:
-        #koboldai_vars.summarizer.to("cpu")
-        koboldai_vars.interogator.to("cpu")
-        koboldai_vars.prompt_gen.to("cpu")
-    torch.cuda.empty_cache()
-
-    #logger.debug("Original Text: {}".format(text))
-    #logger.debug("Summarized Text: {}".format(summarizer_output))
-
-    return generated_prompt
+    return combined_str
 
 #==================================================================#
 # Auto-memory function
